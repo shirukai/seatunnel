@@ -17,6 +17,8 @@
 
 package org.apache.seatunnel.connectors.doris.util;
 
+import org.apache.seatunnel.shade.org.apache.commons.lang3.StringUtils;
+
 import org.apache.seatunnel.api.sink.SaveModePlaceHolder;
 import org.apache.seatunnel.api.table.catalog.CatalogTable;
 import org.apache.seatunnel.api.table.catalog.Column;
@@ -28,8 +30,6 @@ import org.apache.seatunnel.connectors.doris.config.DorisSinkOptions;
 import org.apache.seatunnel.connectors.seatunnel.common.sql.template.SqlTemplate;
 import org.apache.seatunnel.connectors.seatunnel.common.util.CreateTableParser;
 
-import org.apache.commons.lang3.StringUtils;
-
 import lombok.extern.slf4j.Slf4j;
 
 import java.util.Arrays;
@@ -37,6 +37,7 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -205,7 +206,15 @@ public class DorisCatalogUtil {
                 .replaceAll(
                         SaveModePlaceHolder.TABLE.getReplacePlaceHolder(), tablePath.getTableName())
                 .replaceAll(
-                        SaveModePlaceHolder.ROWTYPE_FIELDS.getReplacePlaceHolder(), rowTypeFields);
+                        SaveModePlaceHolder.ROWTYPE_FIELDS.getReplacePlaceHolder(), rowTypeFields)
+                .replaceAll(
+                        SaveModePlaceHolder.COMMENT.getReplacePlaceHolder(),
+                        Objects.isNull(catalogTable.getComment())
+                                ? ""
+                                : catalogTable
+                                        .getComment()
+                                        .replace("'", "''")
+                                        .replace("\\", "\\\\"));
     }
 
     private static String mergeColumnInTemplate(
@@ -249,16 +258,23 @@ public class DorisCatalogUtil {
         return template;
     }
 
-    private static String columnToDorisType(
-            Column column, TypeConverter<BasicTypeDefine> typeConverter) {
+    static String columnToDorisType(Column column, TypeConverter<BasicTypeDefine> typeConverter) {
         checkNotNull(column, "The column is required.");
+        String columnType;
+        if (column.getSinkType() != null) {
+            columnType = column.getSinkType();
+        } else {
+            columnType = typeConverter.reconvert(column).getColumnType();
+        }
         return String.format(
                 "`%s` %s %s %s",
                 column.getName(),
-                typeConverter.reconvert(column).getColumnType(),
+                columnType,
                 column.isNullable() ? "NULL" : "NOT NULL",
                 StringUtils.isEmpty(column.getComment())
                         ? ""
-                        : "COMMENT '" + column.getComment() + "'");
+                        : "COMMENT '"
+                                + column.getComment().replace("'", "''").replace("\\", "\\\\")
+                                + "'");
     }
 }

@@ -17,6 +17,8 @@
 
 package org.apache.seatunnel.connectors.seatunnel.maxcompute.catalog;
 
+import org.apache.seatunnel.shade.org.apache.commons.lang3.StringUtils;
+
 import org.apache.seatunnel.api.sink.SaveModePlaceHolder;
 import org.apache.seatunnel.api.table.catalog.CatalogTable;
 import org.apache.seatunnel.api.table.catalog.Column;
@@ -27,8 +29,6 @@ import org.apache.seatunnel.api.table.converter.TypeConverter;
 import org.apache.seatunnel.connectors.seatunnel.maxcompute.datatype.MaxComputeTypeConverter;
 import org.apache.seatunnel.connectors.seatunnel.maxcompute.util.CreateTableParser;
 
-import org.apache.commons.lang3.StringUtils;
-
 import com.aliyun.odps.type.TypeInfo;
 import lombok.extern.slf4j.Slf4j;
 
@@ -36,6 +36,7 @@ import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -108,7 +109,10 @@ public class MaxComputeCatalogUtil {
                 .replaceAll(
                         SaveModePlaceHolder.TABLE.getReplacePlaceHolder(), tablePath.getTableName())
                 .replaceAll(
-                        SaveModePlaceHolder.ROWTYPE_FIELDS.getReplacePlaceHolder(), rowTypeFields);
+                        SaveModePlaceHolder.ROWTYPE_FIELDS.getReplacePlaceHolder(), rowTypeFields)
+                .replaceAll(
+                        SaveModePlaceHolder.COMMENT.getReplacePlaceHolder(),
+                        Objects.isNull(catalogTable.getComment()) ? "" : catalogTable.getComment());
     }
 
     private static String mergeColumnInTemplate(
@@ -155,10 +159,16 @@ public class MaxComputeCatalogUtil {
     public static String columnToMaxComputeType(
             Column column, TypeConverter<BasicTypeDefine<TypeInfo>> typeConverter) {
         checkNotNull(column, "The column is required.");
+        String columnType;
+        if (column.getSinkType() != null) {
+            columnType = column.getSinkType();
+        } else {
+            columnType = typeConverter.reconvert(column).getColumnType();
+        }
         return String.format(
                 "`%s` %s %s %s",
                 column.getName(),
-                typeConverter.reconvert(column).getColumnType(),
+                columnType,
                 column.isNullable() ? "NULL" : "NOT NULL",
                 StringUtils.isEmpty(column.getComment())
                         ? ""

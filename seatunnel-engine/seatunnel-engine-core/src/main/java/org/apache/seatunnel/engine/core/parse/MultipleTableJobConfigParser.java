@@ -17,13 +17,22 @@
 
 package org.apache.seatunnel.engine.core.parse;
 
+import org.apache.seatunnel.shade.com.google.common.annotations.VisibleForTesting;
 import org.apache.seatunnel.shade.com.google.common.base.Preconditions;
 import org.apache.seatunnel.shade.com.google.common.collect.Lists;
 import org.apache.seatunnel.shade.com.typesafe.config.Config;
+import org.apache.seatunnel.shade.com.typesafe.config.ConfigValue;
+import org.apache.seatunnel.shade.com.typesafe.config.ConfigValueType;
+import org.apache.seatunnel.shade.org.apache.commons.lang3.StringUtils;
+import org.apache.seatunnel.shade.org.apache.commons.lang3.tuple.ImmutablePair;
 
-import org.apache.seatunnel.api.common.CommonOptions;
+import org.apache.seatunnel.api.common.PluginIdentifier;
 import org.apache.seatunnel.api.configuration.ReadonlyConfig;
-import org.apache.seatunnel.api.env.EnvCommonOptions;
+import org.apache.seatunnel.api.configuration.util.ConfigValidator;
+import org.apache.seatunnel.api.metalake.MetalakeConfigUtils;
+import org.apache.seatunnel.api.options.ConnectorCommonOptions;
+import org.apache.seatunnel.api.options.EnvCommonOptions;
+import org.apache.seatunnel.api.options.EnvOptionRule;
 import org.apache.seatunnel.api.sink.SaveModeExecuteLocation;
 import org.apache.seatunnel.api.sink.SaveModeExecuteWrapper;
 import org.apache.seatunnel.api.sink.SaveModeHandler;
@@ -35,25 +44,23 @@ import org.apache.seatunnel.api.source.SourceSplit;
 import org.apache.seatunnel.api.table.catalog.CatalogTable;
 import org.apache.seatunnel.api.table.catalog.TablePath;
 import org.apache.seatunnel.api.table.factory.ChangeStreamTableSourceCheckpoint;
-import org.apache.seatunnel.api.table.factory.Factory;
 import org.apache.seatunnel.api.table.factory.FactoryUtil;
-import org.apache.seatunnel.api.table.factory.TableSinkFactory;
-import org.apache.seatunnel.api.table.factory.TableSourceFactory;
 import org.apache.seatunnel.api.table.type.SeaTunnelDataType;
 import org.apache.seatunnel.api.transform.SeaTunnelTransform;
 import org.apache.seatunnel.common.Constants;
 import org.apache.seatunnel.common.config.Common;
 import org.apache.seatunnel.common.config.TypesafeConfigUtils;
 import org.apache.seatunnel.common.constants.CollectionConstants;
+import org.apache.seatunnel.common.constants.JobMode;
 import org.apache.seatunnel.common.constants.PluginType;
 import org.apache.seatunnel.common.exception.SeaTunnelRuntimeException;
-import org.apache.seatunnel.common.utils.ExceptionUtils;
-import org.apache.seatunnel.core.starter.execution.PluginUtil;
 import org.apache.seatunnel.core.starter.utils.ConfigBuilder;
 import org.apache.seatunnel.engine.common.config.JobConfig;
+import org.apache.seatunnel.engine.common.config.server.DataSourceConfig;
 import org.apache.seatunnel.engine.common.exception.JobDefineCheckException;
 import org.apache.seatunnel.engine.common.exception.SeaTunnelEngineException;
 import org.apache.seatunnel.engine.common.loader.SeaTunnelChildFirstClassLoader;
+import org.apache.seatunnel.engine.common.utils.DataSourceConfigResolver;
 import org.apache.seatunnel.engine.common.utils.IdGenerator;
 import org.apache.seatunnel.engine.core.classloader.ClassLoaderService;
 import org.apache.seatunnel.engine.core.dag.actions.Action;
@@ -63,14 +70,11 @@ import org.apache.seatunnel.engine.core.dag.actions.SourceAction;
 import org.apache.seatunnel.engine.core.dag.actions.TransformAction;
 import org.apache.seatunnel.engine.core.job.ConnectorJarIdentifier;
 import org.apache.seatunnel.engine.core.job.JobPipelineCheckpointData;
-import org.apache.seatunnel.plugin.discovery.PluginIdentifier;
 import org.apache.seatunnel.plugin.discovery.seatunnel.SeaTunnelSinkPluginDiscovery;
 import org.apache.seatunnel.plugin.discovery.seatunnel.SeaTunnelSourcePluginDiscovery;
 import org.apache.seatunnel.plugin.discovery.seatunnel.SeaTunnelTransformPluginDiscovery;
 
 import org.apache.commons.collections4.CollectionUtils;
-import org.apache.commons.lang3.StringUtils;
-import org.apache.commons.lang3.tuple.ImmutablePair;
 
 import lombok.extern.slf4j.Slf4j;
 import scala.Tuple2;
@@ -80,6 +84,7 @@ import java.net.MalformedURLException;
 import java.net.URL;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.sql.DriverManager;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -94,7 +99,6 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Queue;
 import java.util.Set;
-import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -107,6 +111,18 @@ import static org.apache.seatunnel.engine.core.parse.ConfigParserUtil.getInputId
 @Slf4j
 public class MultipleTableJobConfigParser {
 
+    static {
+        // Load DriverManager first to avoid deadlock between DriverManager's
+        // static initialization block and specific driver class's static
+        // initialization block when two different driver classes are loading
+        // concurrently using Class.forName while DriverManager is uninitialized
+        // before.
+        //
+        // This could happen in JDK 8 but not above as driver loading has been
+        // moved out of DriverManager's static initialization block since JDK 9.
+        DriverManager.getDrivers();
+    }
+
     private final IdGenerator idGenerator;
     private final JobConfig jobConfig;
 
@@ -115,15 +131,18 @@ public class MultipleTableJobConfigParser {
 
     private final ReadonlyConfig envOptions;
 
-    private final JobConfigParser fallbackParser;
     private final boolean isStartWithSavePoint;
     private final List<JobPipelineCheckpointData> pipelineCheckpoints;
 
+    private final DataSourceConfig dataSourceConfig;
+
+    @VisibleForTesting
     public MultipleTableJobConfigParser(
             String jobDefineFilePath, IdGenerator idGenerator, JobConfig jobConfig) {
         this(jobDefineFilePath, idGenerator, jobConfig, Collections.emptyList(), false);
     }
 
+    @VisibleForTesting
     public MultipleTableJobConfigParser(
             Config seaTunnelJobConfig, IdGenerator idGenerator, JobConfig jobConfig) {
         this(
@@ -132,9 +151,11 @@ public class MultipleTableJobConfigParser {
                 jobConfig,
                 Collections.emptyList(),
                 false,
-                Collections.emptyList());
+                Collections.emptyList(),
+                new DataSourceConfig());
     }
 
+    @VisibleForTesting
     public MultipleTableJobConfigParser(
             String jobDefineFilePath,
             IdGenerator idGenerator,
@@ -148,7 +169,8 @@ public class MultipleTableJobConfigParser {
                 jobConfig,
                 commonPluginJars,
                 isStartWithSavePoint,
-                Collections.emptyList());
+                Collections.emptyList(),
+                new DataSourceConfig());
     }
 
     public MultipleTableJobConfigParser(
@@ -158,16 +180,16 @@ public class MultipleTableJobConfigParser {
             JobConfig jobConfig,
             List<URL> commonPluginJars,
             boolean isStartWithSavePoint,
-            List<JobPipelineCheckpointData> pipelineCheckpoints) {
-        this.idGenerator = idGenerator;
-        this.jobConfig = jobConfig;
-        this.commonPluginJars = commonPluginJars;
-        this.isStartWithSavePoint = isStartWithSavePoint;
-        this.seaTunnelJobConfig = ConfigBuilder.of(Paths.get(jobDefineFilePath), variables);
-        this.envOptions = ReadonlyConfig.fromConfig(seaTunnelJobConfig.getConfig("env"));
-        this.fallbackParser =
-                new JobConfigParser(idGenerator, commonPluginJars, this, isStartWithSavePoint);
-        this.pipelineCheckpoints = pipelineCheckpoints;
+            List<JobPipelineCheckpointData> pipelineCheckpoints,
+            DataSourceConfig dataSourceConfig) {
+        this(
+                ConfigBuilder.of(Paths.get(jobDefineFilePath), variables),
+                idGenerator,
+                jobConfig,
+                commonPluginJars,
+                isStartWithSavePoint,
+                pipelineCheckpoints,
+                dataSourceConfig);
     }
 
     public MultipleTableJobConfigParser(
@@ -176,16 +198,17 @@ public class MultipleTableJobConfigParser {
             JobConfig jobConfig,
             List<URL> commonPluginJars,
             boolean isStartWithSavePoint,
-            List<JobPipelineCheckpointData> pipelineCheckpoints) {
+            List<JobPipelineCheckpointData> pipelineCheckpoints,
+            DataSourceConfig dataSourceConfig) {
         this.idGenerator = idGenerator;
         this.jobConfig = jobConfig;
         this.commonPluginJars = commonPluginJars;
         this.isStartWithSavePoint = isStartWithSavePoint;
-        this.seaTunnelJobConfig = seaTunnelJobConfig;
+        this.seaTunnelJobConfig = handleDataSource(seaTunnelJobConfig, dataSourceConfig);
         this.envOptions = ReadonlyConfig.fromConfig(seaTunnelJobConfig.getConfig("env"));
-        this.fallbackParser =
-                new JobConfigParser(idGenerator, commonPluginJars, this, isStartWithSavePoint);
         this.pipelineCheckpoints = pipelineCheckpoints;
+        this.dataSourceConfig = dataSourceConfig;
+        ConfigValidator.of(this.envOptions).validate(new EnvOptionRule().optionRule());
     }
 
     public ImmutablePair<List<Action>, Set<URL>> parse(ClassLoaderService classLoaderService) {
@@ -295,7 +318,8 @@ public class MultipleTableJobConfigParser {
                                                 factory))
                         .collect(Collectors.toList());
         List<URL> jarPaths = new ArrayList<>();
-        jarPaths.addAll(new SeaTunnelSinkPluginDiscovery().getPluginJarPaths(factoryIds));
+        jarPaths.addAll(
+                new SeaTunnelSinkPluginDiscovery().getPluginJarAndDependencyPaths(factoryIds));
         jarPaths.addAll(commonPluginJars);
         return jarPaths;
     }
@@ -311,7 +335,13 @@ public class MultipleTableJobConfigParser {
     }
 
     private void fillJobConfigAndCommonJars() {
-        jobConfig.getJobContext().setJobMode(envOptions.get(EnvCommonOptions.JOB_MODE));
+        JobMode jobMode = envOptions.get(EnvCommonOptions.JOB_MODE);
+        jobConfig
+                .getJobContext()
+                .setJobMode(jobMode)
+                .setEnableCheckpoint(
+                        (envOptions.get(EnvCommonOptions.CHECKPOINT_INTERVAL) != null)
+                                || jobMode == JobMode.STREAMING);
         if (StringUtils.isEmpty(jobConfig.getName())
                 || jobConfig.getName().equals(Constants.LOGO)
                 || jobConfig.getName().equals(EnvCommonOptions.JOB_NAME.defaultValue())) {
@@ -340,36 +370,11 @@ public class MultipleTableJobConfigParser {
         log.info("add common jar in plugins :{}", commonPluginJars);
     }
 
-    private static <T extends Factory> boolean isFallback(
-            ClassLoader classLoader,
-            Class<T> factoryClass,
-            String factoryId,
-            Consumer<T> virtualCreator) {
-        Optional<T> factory =
-                FactoryUtil.discoverOptionalFactory(classLoader, factoryClass, factoryId);
-        if (!factory.isPresent()) {
-            return true;
-        }
-        try {
-            virtualCreator.accept(factory.get());
-        } catch (Exception e) {
-            if (e instanceof UnsupportedOperationException
-                    && "The Factory has not been implemented and the deprecated Plugin will be used."
-                            .equals(e.getMessage())) {
-                log.warn(
-                        "The Factory has not been implemented and the deprecated Plugin will be used.");
-                return true;
-            }
-            log.debug(ExceptionUtils.getMessage(e));
-        }
-        return false;
-    }
-
     private int getParallelism(ReadonlyConfig config) {
         return Math.max(
                 1,
-                config.getOptional(CommonOptions.PARALLELISM)
-                        .orElse(envOptions.get(CommonOptions.PARALLELISM)));
+                config.getOptional(EnvCommonOptions.PARALLELISM)
+                        .orElse(envOptions.get(EnvCommonOptions.PARALLELISM)));
     }
 
     public Tuple2<String, List<Tuple2<CatalogTable, Action>>> parseSource(
@@ -377,22 +382,16 @@ public class MultipleTableJobConfigParser {
         final ReadonlyConfig readonlyConfig = ReadonlyConfig.fromConfig(sourceConfig);
         final String factoryId = getFactoryId(readonlyConfig);
         final String tableId =
-                readonlyConfig.getOptional(CommonOptions.PLUGIN_OUTPUT).orElse(DEFAULT_ID);
+                readonlyConfig.getOptional(ConnectorCommonOptions.PLUGIN_OUTPUT).orElse(DEFAULT_ID);
 
         final int parallelism = getParallelism(readonlyConfig);
 
-        boolean fallback =
-                isFallback(
-                        classLoader,
-                        TableSourceFactory.class,
-                        factoryId,
-                        (factory) -> factory.createSource(null));
-
-        if (fallback) {
-            Tuple2<CatalogTable, Action> tuple =
-                    fallbackParser.parseSource(sourceConfig, jobConfig, tableId, parallelism);
-            return new Tuple2<>(tableId, Collections.singletonList(tuple));
-        }
+        Function<PluginIdentifier, SeaTunnelSource> fallbackCreateSource =
+                pluginIdentifier -> {
+                    SeaTunnelSourcePluginDiscovery sourcePluginDiscovery =
+                            new SeaTunnelSourcePluginDiscovery();
+                    return sourcePluginDiscovery.createPluginInstance(pluginIdentifier);
+                };
 
         Tuple2<SeaTunnelSource<Object, SourceSplit, Serializable>, List<CatalogTable>> tuple2;
         if (isStartWithSavePoint && pipelineCheckpoints != null && !pipelineCheckpoints.isEmpty()) {
@@ -400,9 +399,22 @@ public class MultipleTableJobConfigParser {
                     getSourceCheckpoint(configIndex, factoryId);
             tuple2 =
                     FactoryUtil.restoreAndPrepareSource(
-                            readonlyConfig, classLoader, factoryId, checkpoint);
+                            readonlyConfig,
+                            classLoader,
+                            factoryId,
+                            checkpoint,
+                            fallbackCreateSource,
+                            null,
+                            envOptions);
         } else {
-            tuple2 = FactoryUtil.createAndPrepareSource(readonlyConfig, classLoader, factoryId);
+            tuple2 =
+                    FactoryUtil.createAndPrepareSource(
+                            readonlyConfig,
+                            classLoader,
+                            factoryId,
+                            fallbackCreateSource,
+                            null,
+                            envOptions);
         }
 
         Set<URL> factoryUrls = new HashSet<>();
@@ -413,7 +425,7 @@ public class MultipleTableJobConfigParser {
         String actionName = JobConfigParser.createSourceActionName(configIndex, factoryId);
         SeaTunnelSource<Object, SourceSplit, Serializable> source = tuple2._1();
         source.setJobContext(jobConfig.getJobContext());
-        PluginUtil.ensureJobModeMatch(jobConfig.getJobContext(), source);
+        FactoryUtil.ensureJobModeMatch(jobConfig.getJobContext(), source);
         SourceAction<Object, SourceSplit, Serializable> action =
                 new SourceAction<>(id, actionName, tuple2._1(), factoryUrls, new HashSet<>());
         action.setParallelism(parallelism);
@@ -468,7 +480,7 @@ public class MultipleTableJobConfigParser {
         }
 
         final String tableId =
-                readonlyConfig.getOptional(CommonOptions.PLUGIN_OUTPUT).orElse(DEFAULT_ID);
+                readonlyConfig.getOptional(ConnectorCommonOptions.PLUGIN_OUTPUT).orElse(DEFAULT_ID);
 
         Set<Action> inputActions =
                 inputs.stream()
@@ -482,7 +494,7 @@ public class MultipleTableJobConfigParser {
         checkProducedTypeEquals(inputActions);
         int spareParallelism = inputs.get(0)._2().getParallelism();
         int parallelism =
-                readonlyConfig.getOptional(CommonOptions.PARALLELISM).orElse(spareParallelism);
+                readonlyConfig.getOptional(EnvCommonOptions.PARALLELISM).orElse(spareParallelism);
         SeaTunnelTransform<?> transform =
                 FactoryUtil.createAndPrepareMultiTableTransform(
                         new ArrayList<>(catalogTables), readonlyConfig, classLoader, factoryId);
@@ -582,16 +594,6 @@ public class MultipleTableJobConfigParser {
                             "Sink don't support simultaneous writing of data from multi-table source and other sources.");
                 }
             }
-        }
-
-        boolean fallback =
-                isFallback(
-                        classLoader,
-                        TableSinkFactory.class,
-                        factoryId,
-                        (factory) -> factory.createSink(null));
-        if (fallback) {
-            return fallbackParser.parseSinks(configIndex, inputVertices, sinkConfig, jobConfig);
         }
 
         // get jar urls
@@ -695,9 +697,22 @@ public class MultipleTableJobConfigParser {
             String factoryId,
             int parallelism,
             int configIndex) {
+
+        Function<PluginIdentifier, SeaTunnelSink> fallbackCreateSink =
+                pluginIdentifier -> {
+                    SeaTunnelSinkPluginDiscovery sinkPluginDiscovery =
+                            new SeaTunnelSinkPluginDiscovery();
+                    return sinkPluginDiscovery.createPluginInstance(pluginIdentifier);
+                };
+
         SeaTunnelSink<?, ?, ?, ?> sink =
                 FactoryUtil.createAndPrepareSink(
-                        catalogTable, readonlyConfig, classLoader, factoryId);
+                        catalogTable,
+                        readonlyConfig,
+                        classLoader,
+                        factoryId,
+                        fallbackCreateSink,
+                        null);
         sink.setJobContext(jobConfig.getJobContext());
         SinkConfig actionConfig = new SinkConfig(catalogTable.getTableId().toTablePath());
         long id = idGenerator.getNextId();
@@ -715,6 +730,8 @@ public class MultipleTableJobConfigParser {
                         actionConfig);
         if (!isStartWithSavePoint) {
             handleSaveMode(sink);
+        } else {
+            handleSchemaSaveModeWithRestore(sink);
         }
         sinkAction.setParallelism(parallelism);
         return sinkAction;
@@ -741,6 +758,25 @@ public class MultipleTableJobConfigParser {
         }
     }
 
+    public void handleSchemaSaveModeWithRestore(SeaTunnelSink<?, ?, ?, ?> sink) {
+        if (SupportSaveMode.class.isAssignableFrom(sink.getClass())) {
+            SupportSaveMode saveModeSink = (SupportSaveMode) sink;
+            if (envOptions
+                    .get(EnvCommonOptions.SAVEMODE_EXECUTE_LOCATION)
+                    .equals(SaveModeExecuteLocation.CLIENT)) {
+                Optional<SaveModeHandler> saveModeHandler = saveModeSink.getSaveModeHandler();
+                if (saveModeHandler.isPresent()) {
+                    try (SaveModeHandler handler = saveModeHandler.get()) {
+                        handler.open();
+                        handler.handleSchemaSaveModeWithRestore();
+                    } catch (Exception e) {
+                        throw new SeaTunnelRuntimeException(HANDLE_SAVE_MODE_FAILED, e);
+                    }
+                }
+            }
+        }
+    }
+
     private List<URL> getSourcePluginJarPaths(Config sourceConfig) {
         SeaTunnelSourcePluginDiscovery sourcePluginDiscovery = new SeaTunnelSourcePluginDiscovery();
         PluginIdentifier pluginIdentifier =
@@ -749,7 +785,8 @@ public class MultipleTableJobConfigParser {
                         CollectionConstants.SOURCE_PLUGIN,
                         sourceConfig.getString(CollectionConstants.PLUGIN_NAME));
         List<URL> pluginJarPaths =
-                sourcePluginDiscovery.getPluginJarPaths(Lists.newArrayList(pluginIdentifier));
+                sourcePluginDiscovery.getPluginJarAndDependencyPaths(
+                        Lists.newArrayList(pluginIdentifier));
         return pluginJarPaths;
     }
 
@@ -774,7 +811,8 @@ public class MultipleTableJobConfigParser {
                         CollectionConstants.SINK_PLUGIN,
                         sinkConfig.getString(CollectionConstants.PLUGIN_NAME));
         List<URL> pluginJarPaths =
-                sinkPluginDiscovery.getPluginJarPaths(Lists.newArrayList(pluginIdentifier));
+                sinkPluginDiscovery.getPluginJarAndDependencyPaths(
+                        Lists.newArrayList(pluginIdentifier));
         return pluginJarPaths;
     }
 
@@ -814,5 +852,100 @@ public class MultipleTableJobConfigParser {
                                                         : Stream.of(state.getState()))
                         .collect(Collectors.toList());
         return new ChangeStreamTableSourceCheckpoint(coordinatorState, subtaskState);
+    }
+
+    private Config handleDataSource(Config seaTunnelJobConfig, DataSourceConfig dataSourceConfig) {
+        Config tempconfig = seaTunnelJobConfig;
+        // Only resolve datasource configs when:
+        // 1. DataSource is enabled
+        // 2. The job config contains datasource_id in any connector
+        if (dataSourceConfig != null
+                && dataSourceConfig.isEnabled()
+                && hasDatasourceId(seaTunnelJobConfig)) {
+            tempconfig =
+                    DataSourceConfigResolver.resolveDataSourceConfigs(
+                            seaTunnelJobConfig, dataSourceConfig);
+        }
+        // Compatible with old code
+        tempconfig = MetalakeConfigUtils.getMetalakeConfig(tempconfig);
+        return tempconfig;
+    }
+
+    /**
+     * Checks if the job config contains datasource_id in any connector configuration.
+     *
+     * @param config the SeaTunnel job configuration
+     * @return true if any connector (source or sink) contains datasource_id, false otherwise
+     */
+    private boolean hasDatasourceId(Config config) {
+        List<? extends Config> sourceConfigs =
+                TypesafeConfigUtils.getConfigList(
+                        config, PluginType.SOURCE.getType(), Collections.emptyList());
+        for (Config sourceConfig : sourceConfigs) {
+            if (hasDatasourceIdInConnector(sourceConfig)) {
+                return true;
+            }
+        }
+
+        List<? extends Config> sinkConfigs =
+                TypesafeConfigUtils.getConfigList(
+                        config, PluginType.SINK.getType(), Collections.emptyList());
+        for (Config sinkConfig : sinkConfigs) {
+            if (hasDatasourceIdInConnector(sinkConfig)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Checks if a single connector config contains datasource_id.
+     *
+     * @param connectorConfig the connector configuration
+     * @return true if datasource_id is present, false otherwise
+     */
+    private boolean hasDatasourceIdInConnector(Config connectorConfig) {
+        try {
+            // Check at root level
+            if (connectorConfig.hasPath(ConnectorCommonOptions.DATASOURCE_ID.key())) {
+                return true;
+            }
+
+            // Check inside the nested connector config
+            String connectorIdentifier = getConnectorIdentifier(connectorConfig);
+            if (!"unknown".equals(connectorIdentifier)) {
+                Config nestedConfig = connectorConfig.getConfig(connectorIdentifier);
+                if (nestedConfig.hasPath(ConnectorCommonOptions.DATASOURCE_ID.key())) {
+                    return true;
+                }
+            }
+        } catch (Exception e) {
+            log.debug("Failed to check datasource_id in connector config", e);
+        }
+        return false;
+    }
+
+    /**
+     * Gets the connector identifier (plugin name) from a connector config.
+     *
+     * @param config the connector configuration
+     * @return the connector identifier or \”unknown\” if not found
+     */
+    private String getConnectorIdentifier(Config config) {
+        try {
+            if (config.hasPath(ConnectorCommonOptions.PLUGIN_NAME.key())) {
+                return config.getString(ConnectorCommonOptions.PLUGIN_NAME.key());
+            }
+        } catch (Exception e) {
+            // Ignore, try the nested structure approach
+        }
+        // Fallback: look for nested object structure
+        for (Map.Entry<String, ConfigValue> entry : config.root().entrySet()) {
+            if (entry.getValue().valueType() == ConfigValueType.OBJECT) {
+                return entry.getKey();
+            }
+        }
+        return "unknown";
     }
 }
